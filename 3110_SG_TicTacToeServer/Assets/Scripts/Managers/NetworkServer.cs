@@ -3,6 +3,7 @@ using UnityEngine.Assertions;
 using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
+using UnityEditor.MemoryProfiler;
 
 public class NetworkServer : MonoBehaviour
 {
@@ -16,8 +17,18 @@ public class NetworkServer : MonoBehaviour
 
     const int MaxNumberOfClientConnections = 1000;
 
+    // adding the new managers
+    private AccountManager accountManager;
+    private StateManager stateManager;
+
+    private NetworkConnection currentConnetion;
+
     void Start()
     {
+        // creating the new managers
+        accountManager = new AccountManager();
+        stateManager = new StateManager();
+
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
         nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
@@ -32,6 +43,7 @@ public class NetworkServer : MonoBehaviour
 
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
     }
+
 
     void OnDestroy()
     {
@@ -117,6 +129,8 @@ public class NetworkServer : MonoBehaviour
         #endregion
     }
 
+    private NetworkConnection currentConnection;
+
     private bool AcceptIncomingConnection()
     {
         NetworkConnection connection = networkDriver.Accept();
@@ -124,6 +138,7 @@ public class NetworkServer : MonoBehaviour
             return false;
 
         networkConnections.Add(connection);
+        currentConnection = connection;
         return true;
     }
 
@@ -158,4 +173,103 @@ public class NetworkServer : MonoBehaviour
         buffer.Dispose();
     }
 
+    private void HandleLogin(string msg, NetworkConnection connection)
+    {
+        string[] credentials = msg.Split(';');
+        if (credentials.Length != 2)
+        {
+            SendMessageToClient("Invalid login format.", connection);
+            return;
+        }
+
+        string username = credentials[0];
+        string password = credentials[1];
+
+        if (accountManager.ValidateLogin(username, password))
+        {
+            SendMessageToClient("Login successful!", connection);
+            stateManager.SetStateLoggedIn();
+        }
+        else
+        {
+            SendMessageToClient("Invalid username or password.", connection);
+        }
+    }
+
+    private void HandleAccountCreation(string msg, NetworkConnection connection)
+    {
+        string[] credentials = msg.Split(';');
+        if (credentials.Length != 2)
+        {
+            SendMessageToClient("Invalid account creation format.", connection);
+            return;
+        }
+
+        string username = credentials[0];
+        string password = credentials[1];
+
+        if (accountManager.CreateAccount(username, password))
+        {
+            SendMessageToClient("Account created successfully!", connection);
+            stateManager.SetStateWaitingForLogin();
+        }
+        else
+        {
+            SendMessageToClient("Username already exists.", connection);
+        }
+    }
+
+    private void HandleData(DataStreamReader streamReader, NetworkConnection connection)
+    {
+        int msgLength = streamReader.ReadInt();
+        NativeArray<byte> buffer = new NativeArray<byte>(msgLength, Allocator.Persistent);
+        streamReader.ReadBytes(buffer);
+        string msg = Encoding.UTF8.GetString(buffer.ToArray());
+        buffer.Dispose();
+
+        if (stateManager.GetState() == StateManager.ServerState.WaitingForLogin)
+        {
+            HandleLogin(msg, connection);
+        }
+        else if (stateManager.GetState() == StateManager.ServerState.AccountCreation)
+        {
+            HandleAccountCreation(msg, connection);
+        }
+    }
+
+    public void SendAccountCreationRequest(string username, string password, NetworkConnection connection)
+    {
+        bool isCreated = accountManager.CreateAccount(username, password);
+        
+        if (isCreated)
+        {
+            // Send success message to client
+            SendMessageToClient("Account created successfully!", connection);
+        }
+        else
+        {
+            // Send error message to client
+            SendMessageToClient("Username already exists.", connection);
+        }
+    }
+
+    public void SendLoginRequest(string username, string password, NetworkConnection connection)
+    {
+        bool isValid = accountManager.ValidateLogin(username, password);
+        if (isValid)
+        {
+            // Send success message to client
+            SendMessageToClient("Login successful!", connection);
+        }
+        else
+        {
+            // Send error message to client
+            SendMessageToClient("Invalid username or password.", connection);
+        }
+    }
+
+    public NetworkConnection GetCurrentConnection()
+    {
+        return currentConnection;
+    }
 }
