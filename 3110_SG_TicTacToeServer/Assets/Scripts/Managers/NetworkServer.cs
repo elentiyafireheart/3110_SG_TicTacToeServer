@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Assertions;
 using Unity.Collections;
@@ -5,6 +6,8 @@ using Unity.Networking.Transport;
 using System.Text;
 using UnityEditor.MemoryProfiler;
 using UnityEditor.VersionControl;
+using System.IO;
+using Unity.Jobs;
 
 public class NetworkServer : MonoBehaviour
 {
@@ -15,29 +18,26 @@ public class NetworkServer : MonoBehaviour
     NetworkPipeline nonReliableNotInOrderedPipeline;
 
     const ushort NetworkPort = 9001;
-
     const int MaxNumberOfClientConnections = 1000;
 
-    // adding the new managers
-    private AccountManager accountManager;
-    private StateManager stateManager;
+    private NetworkConnection currentConnection;
 
-    private NetworkConnection currentConnetion;
+    List<SaveFiles> playerSaves;
+    private string filePath;
+   
+    private Dictionary<NetworkConnection, int> connectionToPlayerId;
+
+    private enum ServerState
+    {
+        WaitForLogin,
+        LoggedIn
+    }
+
+    private ServerState currentState;
 
     void Start()
     {
-        // creating the new managers
-        //accountManager = new AccountManager();
-       
-        accountManager = GameObject.Find("Managers").GetComponent<AccountManager>();
-        if (accountManager == null)
-        {
-            Debug.LogError("AccountManager not found!");
-        }
-
-        stateManager = new StateManager();
-        Debug.Log("Current State: " + stateManager.GetState());
-
+        
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
         nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
@@ -49,8 +49,22 @@ public class NetworkServer : MonoBehaviour
             Debug.Log("Failed to bind to port " + NetworkPort);
         else
             networkDriver.Listen();
+        Debug.Log("Successfully was able to bind to port " + NetworkPort);
 
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
+
+        #region Account File
+        playerSaves = new List<SaveFiles>();
+        filePath = Application.dataPath + Path.DirectorySeparatorChar + "savedAccountData.txt";
+        if (File.Exists(filePath))
+        {
+            Debug.Log("File Found");
+        }
+
+        LoadPlayer();
+        #endregion
+
+        connectionToPlayerId = new Dictionary<NetworkConnection, int>();
     }
 
 
@@ -62,82 +76,83 @@ public class NetworkServer : MonoBehaviour
 
     void Update()
     {
-        if (stateManager.GetState() == StateManager.ServerState.WaitingForLogin)
+
+        networkDriver.ScheduleUpdate().Complete();
+
+        #region Accept New Connections
+
+        while (AcceptIncomingConnection())
         {
-
-            networkDriver.ScheduleUpdate().Complete();
-
-            #region Remove Unused Connections
-
-            for (int i = 0; i < networkConnections.Length; i++)
-            {
-                if (!networkConnections[i].IsCreated)
-                {
-                    networkConnections.RemoveAtSwapBack(i);
-                    i--;
-                }
-            }
-
-            #endregion
-
-            #region Accept New Connections
-
-            while (AcceptIncomingConnection())
-            {
-                Debug.Log("Accepted a client connection");
-            }
-
-            #endregion
-
-            #region Manage Network Events
-
-            DataStreamReader streamReader;
-            NetworkPipeline pipelineUsedToSendEvent;
-            NetworkEvent.Type networkEventType;
-
-            for (int i = 0; i < networkConnections.Length; i++)
-            {
-                if (!networkConnections[i].IsCreated)
-                    continue;
-
-                while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader,
-                           out pipelineUsedToSendEvent))
-                {
-                    if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
-                        Debug.Log("Network event from: reliableAndInOrderPipeline");
-                    else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
-                        Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
-
-                    switch (networkEventType)
-                    {
-                        case NetworkEvent.Type.Data:
-                            int sizeOfDataBuffer = streamReader.ReadInt();
-                            NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
-                            streamReader.ReadBytes(buffer);
-                            byte[] byteBuffer = buffer.ToArray();
-                            string msg = Encoding.Unicode.GetString(byteBuffer);
-                            ProcessReceivedMsg(msg);
-                            buffer.Dispose();
-                            break;
-                        case NetworkEvent.Type.Disconnect:
-                            Debug.Log("Client has disconnected from server");
-                            networkConnections[i] = default(NetworkConnection);
-                            break;
-                    }
-                }
-            }
-
-            #endregion
+            Debug.Log("Accepted a client connection");
         }
+
+        #endregion
+
+        #region Remove Unused Connections
+
+        for (int i = 0; i < networkConnections.Length; i++)
+        {
+            if (!networkConnections[i].IsCreated)
+            {
+                networkConnections.RemoveAtSwapBack(i);
+                i--;
+            }
+        }
+
+        #endregion
+
+        #region Manage Network Events
+
+        DataStreamReader streamReader;
+        NetworkPipeline pipelineUsedToSendEvent;
+        NetworkEvent.Type networkEventType;
+
+        for (int i = 0; i < networkConnections.Length; i++)
+        {
+            if (!networkConnections[i].IsCreated)
+                continue;
+
+            while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader,
+                       out pipelineUsedToSendEvent))
+            {
+                if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
+                    Debug.Log("Network event from: reliableAndInOrderPipeline");
+                else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
+                    Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
+
+                switch (networkEventType)
+                {
+                    case NetworkEvent.Type.Data:
+                        int sizeOfDataBuffer = streamReader.ReadInt();
+                        NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
+                        streamReader.ReadBytes(buffer);
+                        byte[] byteBuffer = buffer.ToArray();
+                        string msg = Encoding.Unicode.GetString(byteBuffer);
+                        ProcessReceivedMsg(msg);
+                        buffer.Dispose();
+                        break;
+                    case NetworkEvent.Type.Disconnect:
+                        Debug.Log("Client has disconnected from server");
+                        networkConnections[i] = default(NetworkConnection);
+                        break;
+                }
+            }
+        }
+
+        #endregion
+        
     }
 
-   private bool AcceptIncomingConnection()
+    private bool AcceptIncomingConnection()
     {
         NetworkConnection connection = networkDriver.Accept();
         if (connection == default(NetworkConnection))
             return false;
 
         networkConnections.Add(connection);
+
+        int playerId = networkConnections.Length;
+        connectionToPlayerId[connection] = playerId;
 
         return true;
     }
@@ -153,7 +168,108 @@ public class NetworkServer : MonoBehaviour
 
     private void ProcessReceivedMsg(string msg)
     {
-        Debug.Log("Msg received = " + msg);
+        string[] charParse = msg.Split(',');
+        if (charParse.Length < 2)
+        {
+            Debug.LogError("Invalid message format");
+            return;
+        }
+
+        string roomName = charParse[1];  // The room name requested
+
+        // Try parsing the identifier
+        int identifier;
+        if (!int.TryParse(charParse[0], out identifier))
+        {
+            Debug.LogError("Failed to parse identifier: " + charParse[0]);
+            return;
+        }
+
+        
+
+        #region See if they are creating an account or not
+        if (identifier == ClientServerSignifiers.CreateAccount)
+        {
+            string userName = charParse[1];
+            string password = charParse[2];
+            bool checkIsUsed = false;
+            //iterate through all the accounts to check
+            foreach (SaveFiles p in playerSaves)
+            {
+                //if the username matches with one thats already existing
+                if (userName == p.username)
+                {
+                    checkIsUsed = true;
+                }
+            }
+
+            if (checkIsUsed)
+            {
+                foreach (NetworkConnection connection in networkConnections)
+                {
+                    if (connection.IsCreated)
+                    {
+                        SendMessageToClient(ServerClientSignifiers.AccountCreationFailed + ", username is already in use!", connection);
+                        Debug.Log("Failed to create!");
+                    }
+                }
+            }
+            else
+            {
+                foreach (NetworkConnection connection in networkConnections)
+                {
+                    if (connection.IsCreated)
+                    {
+                        SaveNewPlayer(new SaveFiles(userName, password));
+                        SendMessageToClient(ServerClientSignifiers.AccountCreated + ", the new account has been created", connection);
+                        Debug.Log("New user created!");
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region See if they are logging in
+        else if (identifier == ClientServerSignifiers.Login)
+        {
+            string userName = charParse[1];
+            string password = charParse[2];
+            // Handle login logic
+            HandleLogin(userName, password);
+        }
+        #endregion
+
+       // #region Joining Queue
+
+        //else if (identifier == ClientServerSignifiers.JoinQueue)
+        //{
+        //    //HandleJoinOrCreateRoom(roomName);
+        //}
+
+        //#endregion
+
+        //#region Making move
+
+        //else if (identifier == ClientServerSignifiers.MakeMove)
+        //{
+        //    int row = int.Parse(charParse[1]);
+        //    int col = int.Parse(charParse[2]);
+        //    Debug.Log("Move made");
+
+        //    // Broadcast move to opponent
+        //    NotifyOpponentMove(row, col);
+        //}
+
+        //#endregion
+
+        //#region All fails - Send Debug message saying HUH???
+
+        //else
+        //{
+        //    Debug.Log("Unknown identifier: " + identifier);
+        //}
+
+
     }
 
     public void SendMessageToClient(string msg, NetworkConnection networkConnection)
@@ -173,112 +289,146 @@ public class NetworkServer : MonoBehaviour
         buffer.Dispose();
     }
 
-    private void SendUIUpdateToClient(string message, NetworkConnection connection)
+    #region Classes
+
+    public class SaveFiles
     {
-        byte[] msgAsByteArray = Encoding.UTF8.GetBytes(message);
-        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
+        #region Variables
 
-        DataStreamWriter streamWriter;
-        networkDriver.BeginSend(reliableAndInOrderPipeline, connection, out streamWriter);
-        streamWriter.WriteInt(buffer.Length);
-        streamWriter.WriteBytes(buffer);
-        networkDriver.EndSend(streamWriter);
+        public string username;
+        public string password;
 
-        buffer.Dispose();
+        #endregion
+
+        public SaveFiles(string username, string password)
+        {
+            this.username = username;
+            this.password = password;
+        }
+
     }
 
-    private void HandleLogin(string msg, NetworkConnection connection)
+    #endregion
+
+    #region Save/Load Player
+
+    private void SaveNewPlayer(SaveFiles newSave)
     {
-        string[] credentials = msg.Split(';');
-        if (credentials.Length != 2)
-        {
-            SendMessageToClient("Invalid login format.", connection);
+        playerSaves.Add(newSave);
+
+        StreamWriter streamWriter = new StreamWriter(filePath, true);
+        streamWriter.WriteLine(newSave.username + ":" + newSave.password);
+        streamWriter.Close();
+    }
+
+    private void LoadPlayer()
+    {
+        if (File.Exists(filePath) == false)
             return;
-        }
 
-        string username = credentials[0];
-        string password = credentials[1];
+        string line = "";
 
-        if (accountManager.ValidateLogin(username, password))
+        StreamReader streamReader = new StreamReader(filePath);
+        while ((line = streamReader.ReadLine()) != null)
         {
-            SendMessageToClient("Login successful!", connection);
-            stateManager.SetStateLoggedIn();
+            string[] charParse = line.Split(',');
+            playerSaves.Add(new SaveFiles(charParse[0], charParse[1]));
+        }
+        streamReader.Close();
+    }
+
+    public bool CheckUserCredentials(string username, string password)
+    {
+        foreach (var account in playerSaves)
+        {
+            if (account.username == username && account.password == password)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    #endregion
+
+    #region Login
+
+    private void HandleLogin(string userName, string password)
+    {
+        bool loginSuccessful = false;
+
+        foreach (SaveFiles s in playerSaves)
+        {
+            if (userName == s.username && password == s.password)
+            {
+                loginSuccessful = true;
+                break;
+            }
+        }
+        if (loginSuccessful)
+        {
+            // If login is successful, send a success message to the client
+            foreach (NetworkConnection connection in networkConnections)
+            {
+                if (connection.IsCreated)
+                {
+                    SendMessageToClient(ServerClientSignifiers.LoginComplete + "", connection);
+
+                    Debug.Log("Login successful for " + userName);
+                }
+            }
         }
         else
         {
-            SendMessageToClient("Invalid username or password.", connection);
+            // If login fails, send a failure message to the client
+            foreach (NetworkConnection connection in networkConnections)
+            {
+                if (connection.IsCreated)
+                {
+                    SendMessageToClient(ServerClientSignifiers.LoginFailed + "", connection);
+
+                    Debug.Log("Login failed for " + userName);
+                }
+            }
         }
     }
 
-    private void HandleAccountCreation(string msg, NetworkConnection connection)
+    #endregion
+
+    #region Signifiers
+
+    public static class ClientServerSignifiers
     {
-        string[] credentials = msg.Split(';');
-        if (credentials.Length != 2)
-        {
-            SendMessageToClient("Invalid account creation format.", connection);
-            return;
-        }
+        public const int CreateAccount = 1;
+        public const int Login = 2;
 
-        string username = credentials[0];
-        string password = credentials[1];
+        public const int JoinQueue = 3;
+        public const int MakeMove = 4;
 
-        if (accountManager.CreateAccount(username, password))
-        {
-            SendMessageToClient("Account created successfully!", connection);
-            stateManager.SetStateWaitingForLogin();
-        }
-        else
-        {
-            SendMessageToClient("Username already exists.", connection);
-        }
+        public const int ChosenAsPlayerOne = 6;
+        public const int ChosenAsPlayerTwo = 7;
+
+        public const int OpponentChoseASquare = 8;
+
     }
 
-    private void HandleData(DataStreamReader streamReader, NetworkConnection connection)
+    public static class ServerClientSignifiers
     {
-        int msgLength = streamReader.ReadInt();
-        NativeArray<byte> buffer = new NativeArray<byte>(msgLength, Allocator.Persistent);
-        streamReader.ReadBytes(buffer);
-        string msg = Encoding.UTF8.GetString(buffer.ToArray());
-        buffer.Dispose();
+        public const int LoginComplete = 1;
+        public const int LoginFailed = 2;
 
-        if (stateManager.GetState() == StateManager.ServerState.WaitingForLogin)
-        {
-            HandleLogin(msg, connection);
-        }
-        else if (stateManager.GetState() == StateManager.ServerState.AccountCreation)
-        {
-            HandleAccountCreation(msg, connection);
-        }
+        public const int AccountCreated = 3;
+        public const int AccountCreationFailed = 4;
+
+        public const int StartGame = 5;
+
+        public const int ChosenAsPlayerOne = 6;
+        public const int ChosenAsPlayerTwo = 7;
+
+        public const int OpponentChoseASquare = 8;
+        //public const int MoveSelected = 9;
     }
 
-    public void SendAccountCreationRequest(string username, string password, NetworkConnection connection)
-    {
-        bool isCreated = accountManager.CreateAccount(username, password);
-        
-        if (isCreated)
-        {
-            // Send success message to client
-            SendMessageToClient("Account created successfully!", connection);
-        }
-        else
-        {
-            // Send error message to client
-            SendMessageToClient("Username already exists.", connection);
-        }
-    }
+    #endregion
 
-    public void SendLoginRequest(string username, string password, NetworkConnection connection)
-    {
-        bool isValid = accountManager.ValidateLogin(username, password);
-        if (isValid)
-        {
-            // Send success message to client
-            SendMessageToClient("Login successful!", connection);
-        }
-        else
-        {
-            // Send error message to client
-            SendMessageToClient("Invalid username or password.", connection);
-        }
-    }
 }
