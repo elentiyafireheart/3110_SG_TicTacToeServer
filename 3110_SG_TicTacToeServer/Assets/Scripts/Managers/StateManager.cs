@@ -2,7 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
-public class StateManager : MonoBehaviour
+public class StateManager
 {
     // this is going to be responsible for tracking and updating the login
     public enum ServerState

@@ -4,6 +4,7 @@ using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
 using UnityEditor.MemoryProfiler;
+using UnityEditor.VersionControl;
 
 public class NetworkServer : MonoBehaviour
 {
@@ -26,8 +27,16 @@ public class NetworkServer : MonoBehaviour
     void Start()
     {
         // creating the new managers
-        accountManager = new AccountManager();
+        //accountManager = new AccountManager();
+       
+        accountManager = GameObject.Find("Managers").GetComponent<AccountManager>();
+        if (accountManager == null)
+        {
+            Debug.LogError("AccountManager not found!");
+        }
+
         stateManager = new StateManager();
+        Debug.Log("Current State: " + stateManager.GetState());
 
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
@@ -53,92 +62,83 @@ public class NetworkServer : MonoBehaviour
 
     void Update()
     {
-        #region Check Input and Send Msg
-
-        if (Input.GetKeyDown(KeyCode.A))
+        if (stateManager.GetState() == StateManager.ServerState.WaitingForLogin)
         {
+
+            networkDriver.ScheduleUpdate().Complete();
+
+            #region Remove Unused Connections
+
             for (int i = 0; i < networkConnections.Length; i++)
             {
-                SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i]);
-            }
-        }
-
-        #endregion
-
-        networkDriver.ScheduleUpdate().Complete();
-
-        #region Remove Unused Connections
-
-        for (int i = 0; i < networkConnections.Length; i++)
-        {
-            if (!networkConnections[i].IsCreated)
-            {
-                networkConnections.RemoveAtSwapBack(i);
-                i--;
-            }
-        }
-
-        #endregion
-
-        #region Accept New Connections
-
-        while (AcceptIncomingConnection())
-        {
-            Debug.Log("Accepted a client connection");
-        }
-
-        #endregion
-
-        #region Manage Network Events
-
-        DataStreamReader streamReader;
-        NetworkPipeline pipelineUsedToSendEvent;
-        NetworkEvent.Type networkEventType;
-
-        for (int i = 0; i < networkConnections.Length; i++)
-        {
-            if (!networkConnections[i].IsCreated)
-                continue;
-
-            while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader, out pipelineUsedToSendEvent))
-            {
-                if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
-                    Debug.Log("Network event from: reliableAndInOrderPipeline");
-                else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
-                    Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
-
-                switch (networkEventType)
+                if (!networkConnections[i].IsCreated)
                 {
-                    case NetworkEvent.Type.Data:
-                        int sizeOfDataBuffer = streamReader.ReadInt();
-                        NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
-                        streamReader.ReadBytes(buffer);
-                        byte[] byteBuffer = buffer.ToArray();
-                        string msg = Encoding.Unicode.GetString(byteBuffer);
-                        ProcessReceivedMsg(msg);
-                        buffer.Dispose();
-                        break;
-                    case NetworkEvent.Type.Disconnect:
-                        Debug.Log("Client has disconnected from server");
-                        networkConnections[i] = default(NetworkConnection);
-                        break;
+                    networkConnections.RemoveAtSwapBack(i);
+                    i--;
                 }
             }
-        }
 
-        #endregion
+            #endregion
+
+            #region Accept New Connections
+
+            while (AcceptIncomingConnection())
+            {
+                Debug.Log("Accepted a client connection");
+            }
+
+            #endregion
+
+            #region Manage Network Events
+
+            DataStreamReader streamReader;
+            NetworkPipeline pipelineUsedToSendEvent;
+            NetworkEvent.Type networkEventType;
+
+            for (int i = 0; i < networkConnections.Length; i++)
+            {
+                if (!networkConnections[i].IsCreated)
+                    continue;
+
+                while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader,
+                           out pipelineUsedToSendEvent))
+                {
+                    if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
+                        Debug.Log("Network event from: reliableAndInOrderPipeline");
+                    else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
+                        Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
+
+                    switch (networkEventType)
+                    {
+                        case NetworkEvent.Type.Data:
+                            int sizeOfDataBuffer = streamReader.ReadInt();
+                            NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
+                            streamReader.ReadBytes(buffer);
+                            byte[] byteBuffer = buffer.ToArray();
+                            string msg = Encoding.Unicode.GetString(byteBuffer);
+                            ProcessReceivedMsg(msg);
+                            buffer.Dispose();
+                            break;
+                        case NetworkEvent.Type.Disconnect:
+                            Debug.Log("Client has disconnected from server");
+                            networkConnections[i] = default(NetworkConnection);
+                            break;
+                    }
+                }
+            }
+
+            #endregion
+        }
     }
 
-    private NetworkConnection currentConnection;
-
-    private bool AcceptIncomingConnection()
+   private bool AcceptIncomingConnection()
     {
         NetworkConnection connection = networkDriver.Accept();
         if (connection == default(NetworkConnection))
             return false;
 
         networkConnections.Add(connection);
-        currentConnection = connection;
+
         return true;
     }
 
@@ -166,6 +166,20 @@ public class NetworkServer : MonoBehaviour
         DataStreamWriter streamWriter;
         //networkConnection.
         networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out streamWriter);
+        streamWriter.WriteInt(buffer.Length);
+        streamWriter.WriteBytes(buffer);
+        networkDriver.EndSend(streamWriter);
+
+        buffer.Dispose();
+    }
+
+    private void SendUIUpdateToClient(string message, NetworkConnection connection)
+    {
+        byte[] msgAsByteArray = Encoding.UTF8.GetBytes(message);
+        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
+
+        DataStreamWriter streamWriter;
+        networkDriver.BeginSend(reliableAndInOrderPipeline, connection, out streamWriter);
         streamWriter.WriteInt(buffer.Length);
         streamWriter.WriteBytes(buffer);
         networkDriver.EndSend(streamWriter);
@@ -266,10 +280,5 @@ public class NetworkServer : MonoBehaviour
             // Send error message to client
             SendMessageToClient("Invalid username or password.", connection);
         }
-    }
-
-    public NetworkConnection GetCurrentConnection()
-    {
-        return currentConnection;
     }
 }

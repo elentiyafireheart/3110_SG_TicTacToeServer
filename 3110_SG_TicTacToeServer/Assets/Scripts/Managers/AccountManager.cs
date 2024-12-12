@@ -2,28 +2,40 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using Unity.Networking.Transport;
 using UnityEngine;
 
 public class AccountManager : MonoBehaviour
 {
-    private Dictionary<string, string> accounts = new Dictionary<string, string>();
-    private const string filePath = "SavedData/TicTacSaved.txt";
+    private Dictionary<NetworkConnection, int> connectionToPlayerId;
+    List<SaveFiles> playerSaves;
+    private string filePath;
 
     public void Start()
     {
+        playerSaves= new List<SaveFiles>();
+        filePath = Application.dataPath + Path.DirectorySeparatorChar + "savedAccountData.txt";
+        if (File.Exists(filePath))
+        {
+            Debug.Log("File Found");
+        }
+
         LoadAccountsFromFile();
+
+        connectionToPlayerId = new Dictionary<NetworkConnection, int>();
     }
 
 
     //stores account info / checks if it exists
     public bool CreateAccount(string username, string password)
     {
-        if (accounts.ContainsKey(username))
+        if (playerSaves.Exists(account => account.username == username))
         {
             return false; // account exists
         }
 
-        accounts[username] = password;
+        SaveFiles newAccount = new SaveFiles(username, password);
+        playerSaves.Add(newAccount);
         SaveAccountsToFile();
         return true;
     }
@@ -31,7 +43,8 @@ public class AccountManager : MonoBehaviour
     // validates login
     public bool ValidateLogin(string username, string password)
     {
-        if (accounts.ContainsKey(username) && accounts[username] == password)
+        SaveFiles account = playerSaves.Find(acc => acc.username == username);
+        if (account != null && account.password == password)
         {
             return true; // successful login
         }
@@ -40,27 +53,53 @@ public class AccountManager : MonoBehaviour
     }
     private void SaveAccountsToFile()
     {
-        using (StreamWriter streamWriter = new StreamWriter(filePath))
+        try
         {
-            foreach (var login in accounts)
+            using (StreamWriter streamWriter = new StreamWriter(filePath))
             {
-                streamWriter.WriteLine(login.Key + ";" + login.Value);
-            }
-        }
-    }
-    private void LoadAccountsFromFile()
-    {
-        if (File.Exists(filePath))
-        {
-            string[] lines = File.ReadAllLines(filePath);
-            foreach (var line in lines)
-            {
-                string[] accountData = line.Split(';');
-                if (accountData.Length == 2)
+                foreach (var account in playerSaves)
                 {
-                    accounts[accountData[0]] = accountData[1];
+                    streamWriter.WriteLine(account.username + ";" + account.password);
                 }
             }
         }
+        catch (IOException ex)
+        {
+            Debug.LogError("Failed to save accounts to file: " + ex.Message);
+        }
+    }
+
+    private void LoadAccountsFromFile()
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                string[] lines = File.ReadAllLines(filePath);
+                foreach (var line in lines)
+                {
+                    string[] accountData = line.Split(';');
+                    if (accountData.Length == 2)
+                    {
+                        playerSaves.Add(new SaveFiles(accountData[0], accountData[1]));
+                    }
+                }
+            }
+        }
+        catch (IOException ex)
+        {
+            Debug.LogError("Failed to load accounts from file: " + ex.Message);
+        }
+    }
+}
+public class SaveFiles
+{
+    public string username;
+    public string password;
+
+    public SaveFiles(string username, string password)
+    {
+        this.username = username;
+        this.password = password;
     }
 }
