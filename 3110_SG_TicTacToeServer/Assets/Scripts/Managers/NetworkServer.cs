@@ -8,9 +8,12 @@ using UnityEditor.MemoryProfiler;
 using UnityEditor.VersionControl;
 using System.IO;
 using Unity.Jobs;
+using System.Linq;
 
 public class NetworkServer : MonoBehaviour
 {
+    #region Variables
+
     public NetworkDriver networkDriver;
     private NativeList<NetworkConnection> networkConnections;
 
@@ -18,26 +21,22 @@ public class NetworkServer : MonoBehaviour
     NetworkPipeline nonReliableNotInOrderedPipeline;
 
     const ushort NetworkPort = 9001;
+
     const int MaxNumberOfClientConnections = 1000;
 
-    private NetworkConnection currentConnection;
+    List<Account> savedAccounts;
+    string filePath;
 
-    List<SaveFiles> playerSaves;
-    private string filePath;
-   
+    LinkedList<GameRoom> roomList;
+    public int playerMatchID = -1;
+
+    // Mapping between NetworkConnection and unique player ID
     private Dictionary<NetworkConnection, int> connectionToPlayerId;
 
-    private enum ServerState
-    {
-        WaitForLogin,
-        LoggedIn
-    }
-
-    private ServerState currentState;
+    #endregion
 
     void Start()
     {
-        
         networkDriver = NetworkDriver.Create();
         reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
         nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
@@ -51,22 +50,27 @@ public class NetworkServer : MonoBehaviour
             networkDriver.Listen();
         Debug.Log("Successfully was able to bind to port " + NetworkPort);
 
+
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
 
-        #region Account File
-        playerSaves = new List<SaveFiles>();
+        #region Account File Path
+        savedAccounts = new List<Account>();
         filePath = Application.dataPath + Path.DirectorySeparatorChar + "savedAccountData.txt";
         if (File.Exists(filePath))
         {
-            Debug.Log("File Found");
+            Debug.Log("File found!");
         }
 
-        LoadPlayer();
+        LoadOldUser();
+
         #endregion
 
-        connectionToPlayerId = new Dictionary<NetworkConnection, int>();
-    }
+        roomList = new LinkedList<GameRoom>();
 
+        // Initialize dictionary for mapping connections to player IDs
+        connectionToPlayerId = new Dictionary<NetworkConnection, int>();
+
+    }
 
     void OnDestroy()
     {
@@ -76,17 +80,19 @@ public class NetworkServer : MonoBehaviour
 
     void Update()
     {
+        #region Check Input and Send Msg
 
-        networkDriver.ScheduleUpdate().Complete();
-
-        #region Accept New Connections
-
-        while (AcceptIncomingConnection())
-        {
-            Debug.Log("Accepted a client connection");
-        }
+        //if (Input.GetKeyDown(KeyCode.A))
+        //{
+        //    for (int i = 0; i < networkConnections.Length; i++)
+        //    {
+        //        SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i]);
+        //    }
+        //}
 
         #endregion
+
+        networkDriver.ScheduleUpdate().Complete();
 
         #region Remove Unused Connections
 
@@ -97,6 +103,15 @@ public class NetworkServer : MonoBehaviour
                 networkConnections.RemoveAtSwapBack(i);
                 i--;
             }
+        }
+
+        #endregion
+
+        #region Accept New Connections
+
+        while (AcceptIncomingConnection())
+        {
+            Debug.Log("Accepted a client connection");
         }
 
         #endregion
@@ -112,8 +127,7 @@ public class NetworkServer : MonoBehaviour
             if (!networkConnections[i].IsCreated)
                 continue;
 
-            while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader,
-                       out pipelineUsedToSendEvent))
+            while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader, out pipelineUsedToSendEvent))
             {
                 if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
                     Debug.Log("Network event from: reliableAndInOrderPipeline");
@@ -140,9 +154,9 @@ public class NetworkServer : MonoBehaviour
         }
 
         #endregion
-        
     }
 
+    #region Methods
     private bool AcceptIncomingConnection()
     {
         NetworkConnection connection = networkDriver.Accept();
@@ -166,8 +180,14 @@ public class NetworkServer : MonoBehaviour
         return true;
     }
 
+    //this need to get reworked
     private void ProcessReceivedMsg(string msg)
     {
+        Debug.Log("Msg received = " + msg);
+
+        #region Check to see what message was sent via Signifier
+
+        //process each line from the file
         string[] charParse = msg.Split(',');
         if (charParse.Length < 2)
         {
@@ -185,7 +205,7 @@ public class NetworkServer : MonoBehaviour
             return;
         }
 
-        
+        #region Depending on identifier sent back, work accordingly
 
         #region See if they are creating an account or not
         if (identifier == ClientServerSignifiers.CreateAccount)
@@ -194,10 +214,10 @@ public class NetworkServer : MonoBehaviour
             string password = charParse[2];
             bool checkIsUsed = false;
             //iterate through all the accounts to check
-            foreach (SaveFiles p in playerSaves)
+            foreach (Account a in savedAccounts)
             {
                 //if the username matches with one thats already existing
-                if (userName == p.username)
+                if (userName == a.username)
                 {
                     checkIsUsed = true;
                 }
@@ -220,7 +240,7 @@ public class NetworkServer : MonoBehaviour
                 {
                     if (connection.IsCreated)
                     {
-                        SaveNewPlayer(new SaveFiles(userName, password));
+                        SaveNewUser(new Account(userName, password));
                         SendMessageToClient(ServerClientSignifiers.AccountCreated + ", the new account has been created", connection);
                         Debug.Log("New user created!");
                     }
@@ -239,44 +259,122 @@ public class NetworkServer : MonoBehaviour
         }
         #endregion
 
-       // #region Joining Queue
+        #region Joining Queue
 
-        //else if (identifier == ClientServerSignifiers.JoinQueue)
-        //{
-        //    //HandleJoinOrCreateRoom(roomName);
-        //}
+        else if (identifier == ClientServerSignifiers.JoinQueue)
+        {
+            HandleJoinOrCreateRoom(roomName);
+        }
 
-        //#endregion
+        #endregion
 
-        //#region Making move
+        #region Making move
 
-        //else if (identifier == ClientServerSignifiers.MakeMove)
-        //{
-        //    int row = int.Parse(charParse[1]);
-        //    int col = int.Parse(charParse[2]);
-        //    Debug.Log("Move made");
+        else if (identifier == ClientServerSignifiers.MakeMove)
+        {
+            int row = int.Parse(charParse[1]);
+            int col = int.Parse(charParse[2]);
+            Debug.Log("Move made");
 
-        //    // Broadcast move to opponent
-        //    NotifyOpponentMove(row, col);
-        //}
+            // Broadcast move to opponent
+            NotifyOpponentMove(row, col);
+        }
 
-        //#endregion
+        #endregion
 
-        //#region All fails - Send Debug message saying HUH???
+        #region All fails - Send Debug message saying HUH???
 
-        //else
-        //{
-        //    Debug.Log("Unknown identifier: " + identifier);
-        //}
+        else
+        {
+            Debug.Log("Unknown identifier: " + identifier);
+        }
 
+        #endregion
 
+        #endregion
+
+        #endregion
     }
+
+    #region Room join / Creation
+
+    private void HandleJoinOrCreateRoom(string roomName)
+    {
+        if (playerMatchID == -1)
+        {
+            playerMatchID = GetNextPlayerMatchID();
+        }
+
+        // Check if a room with the given name already exists
+        GameRoom existingRoom = roomList.FirstOrDefault(r => r.roomName == roomName);
+
+        if (existingRoom != null && existingRoom.playerID2 == -1)
+        {
+            // If the room exists and has space, assign the player to this room
+            existingRoom.playerID2 = playerMatchID;
+            Debug.Log($"Joined existing room: {roomName} with playerID: {playerMatchID}");
+
+            //Notify both players to start the game
+            foreach (var connection in networkConnections)
+            {
+                if (connectionToPlayerId.ContainsKey(connection))
+                {
+                    int playerId = connectionToPlayerId[connection];
+
+                    #region If the ID matchs player 1 - Assign player 1 role
+
+                    if (playerId == existingRoom.playerID1)
+                    {
+                        SendMessageToClient(ServerClientSignifiers.StartGame + "", connection);
+
+                        playerMatchID = -1;
+                        SendMessageToClient(ServerClientSignifiers.ChosenAsPlayerOne + "", connection);
+
+                        Debug.Log("Player 1 chosen " + playerId + ", to " + connection);
+                        Debug.Log(existingRoom.playerID1);
+                    }
+
+                    #endregion
+
+                    #region If it matches player 2 - Assign player 2 role
+
+                    if (playerId == existingRoom.playerID2)
+                    {
+                        SendMessageToClient(ServerClientSignifiers.StartGame + "", connection);
+                        Debug.Log("Player 2 chosen " + playerId + ", to " + connection);
+                        Debug.Log(existingRoom.playerID2);
+                        SendMessageToClient(ServerClientSignifiers.ChosenAsPlayerTwo + "", connection);
+                    }
+
+                    #endregion
+                }
+            }
+
+        }
+        else
+        {
+            // If no available room exists, create a new room
+            GameRoom newRoom = new GameRoom(playerMatchID, -1) { roomName = roomName };
+            roomList.AddLast(newRoom);
+            Debug.Log($"Created new room: {roomName} with playerID: {playerMatchID}");
+        }
+
+        playerMatchID = -1;
+    }
+
+    #endregion
+
+    private int GetNextPlayerMatchID()
+    {
+        return networkConnections.Length;
+    }
+
+    #region Send message to client
 
     public void SendMessageToClient(string msg, NetworkConnection networkConnection)
     {
         byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
         NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
-
 
         //Driver.BeginSend(m_Connection, out var writer);
         DataStreamWriter streamWriter;
@@ -289,57 +387,39 @@ public class NetworkServer : MonoBehaviour
         buffer.Dispose();
     }
 
-    #region Classes
-
-    public class SaveFiles
-    {
-        #region Variables
-
-        public string username;
-        public string password;
-
-        #endregion
-
-        public SaveFiles(string username, string password)
-        {
-            this.username = username;
-            this.password = password;
-        }
-
-    }
-
     #endregion
 
-    #region Save/Load Player
-
-    private void SaveNewPlayer(SaveFiles newSave)
+    #region Login Methods
+    private void SaveNewUser(Account newAccount)
     {
-        playerSaves.Add(newSave);
+        //add new account
+        savedAccounts.Add(newAccount);
 
-        StreamWriter streamWriter = new StreamWriter(filePath, true);
-        streamWriter.WriteLine(newSave.username + ":" + newSave.password);
-        streamWriter.Close();
+        StreamWriter sw = new StreamWriter(filePath, true);
+        sw.WriteLine(newAccount.username + "," + newAccount.password);
+
+        sw.Close();
     }
 
-    private void LoadPlayer()
+    private void LoadOldUser()
     {
         if (File.Exists(filePath) == false)
             return;
 
         string line = "";
 
-        StreamReader streamReader = new StreamReader(filePath);
-        while ((line = streamReader.ReadLine()) != null)
+        StreamReader sr = new StreamReader(filePath);
+        while ((line = sr.ReadLine()) != null)
         {
             string[] charParse = line.Split(',');
-            playerSaves.Add(new SaveFiles(charParse[0], charParse[1]));
+            savedAccounts.Add(new Account(charParse[0], charParse[1]));
         }
-        streamReader.Close();
+        sr.Close();
     }
 
-    public bool CheckUserCredentials(string username, string password)
+    public bool CheckCredentials(string username, string password)
     {
-        foreach (var account in playerSaves)
+        foreach (var account in savedAccounts)
         {
             if (account.username == username && account.password == password)
             {
@@ -349,23 +429,21 @@ public class NetworkServer : MonoBehaviour
         return false;
     }
 
-    #endregion
-
-    #region Login
-
     private void HandleLogin(string userName, string password)
     {
-        bool loginSuccessful = false;
+        bool loginSuccess = false;
 
-        foreach (SaveFiles s in playerSaves)
+        // Check if the user exists and the password is correct
+        foreach (Account a in savedAccounts)
         {
-            if (userName == s.username && password == s.password)
+            if (userName == a.username && password == a.password)
             {
-                loginSuccessful = true;
+                loginSuccess = true;
                 break;
             }
         }
-        if (loginSuccessful)
+
+        if (loginSuccess)
         {
             // If login is successful, send a success message to the client
             foreach (NetworkConnection connection in networkConnections)
@@ -395,40 +473,99 @@ public class NetworkServer : MonoBehaviour
 
     #endregion
 
-    #region Signifiers
-
-    public static class ClientServerSignifiers
+    private void NotifyOpponentMove(int row, int col)
     {
-        public const int CreateAccount = 1;
-        public const int Login = 2;
+        foreach (var connection in networkConnections)
+        {
+            if (connectionToPlayerId.ContainsKey(connection))
+            {
+                int playerId = connectionToPlayerId[connection];
 
-        public const int JoinQueue = 3;
-        public const int MakeMove = 4;
-
-        public const int ChosenAsPlayerOne = 6;
-        public const int ChosenAsPlayerTwo = 7;
-
-        public const int OpponentChoseASquare = 8;
-
-    }
-
-    public static class ServerClientSignifiers
-    {
-        public const int LoginComplete = 1;
-        public const int LoginFailed = 2;
-
-        public const int AccountCreated = 3;
-        public const int AccountCreationFailed = 4;
-
-        public const int StartGame = 5;
-
-        public const int ChosenAsPlayerOne = 6;
-        public const int ChosenAsPlayerTwo = 7;
-
-        public const int OpponentChoseASquare = 8;
-        //public const int MoveSelected = 9;
+                if (playerId != playerMatchID)
+                {
+                    Debug.Log("Sending move made to client...");
+                    SendMessageToClient($"{ClientServerSignifiers.MakeMove},{row},{col}", connection);
+                }
+            }
+        }
     }
 
     #endregion
 
 }
+
+#region Signifiers
+
+public static class ClientServerSignifiers
+{
+    public const int CreateAccount = 1;
+    public const int Login = 2;
+
+    public const int JoinQueue = 3;
+    public const int MakeMove = 4;
+
+    public const int ChosenAsPlayerOne = 6;
+    public const int ChosenAsPlayerTwo = 7;
+
+    public const int OpponentChoseASquare = 8;
+
+}
+
+public static class ServerClientSignifiers
+{
+    public const int LoginComplete = 1;
+    public const int LoginFailed = 2;
+
+    public const int AccountCreated = 3;
+    public const int AccountCreationFailed = 4;
+
+    public const int StartGame = 5;
+
+    public const int ChosenAsPlayerOne = 6;
+    public const int ChosenAsPlayerTwo = 7;
+
+    public const int OpponentChoseASquare = 8;
+    //public const int MoveSelected = 9;
+}
+
+#endregion
+
+#region New Classes
+public class Account
+{
+    #region Variables
+
+    public string username;
+    public string password;
+
+    #endregion
+
+    public Account(string username, string password)
+    {
+        this.username = username;
+        this.password = password;
+    }
+
+}
+public class GameRoom
+{
+    public int playerID1;
+    public int playerID2;
+    public string roomName;
+
+    public GameRoom(int playerID1, int playerID2)
+    {
+        this.playerID1 = playerID1;
+
+        this.playerID2 = playerID2;
+    }
+}
+#endregion
+
+#region ENUM
+public enum GameState
+{
+    Login,
+    InGame,
+}
+#endregion
